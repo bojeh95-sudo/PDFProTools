@@ -3,7 +3,6 @@ import path from 'path';
 import { promises as fs } from 'node:fs';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import pkg from 'pdf-encrypt-decrypt';
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, AlignmentType, Table, TableRow, TableCell, WidthType } from 'docx';
@@ -1431,6 +1430,7 @@ Return ONLY the raw JSON array. Do not wrap it in markdown or backticks. If you 
   // Setup Vite Dev Server reference if in development
   let viteDevServer: any = null;
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import('vite');
     viteDevServer = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
