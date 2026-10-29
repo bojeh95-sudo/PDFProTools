@@ -1246,6 +1246,7 @@ export const ToolPlayground: React.FC<ToolPlaygroundProps> = ({ toolId, toolName
 
   // Processing states
   const [status, setStatus] = useState<'idle' | 'processing' | 'success' | 'error'>('idle');
+  const [processingMessage, setProcessingMessage] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   const [resultBlob, setResultBlob] = useState<Blob | Uint8Array | string | null>(null);
@@ -2325,6 +2326,15 @@ export const ToolPlayground: React.FC<ToolPlaygroundProps> = ({ toolId, toolName
     setAiTextResult('');
     setBatchResults([]);
     setBatchProgress(null);
+    if (toolId === 'pdf2word') {
+      setProcessingMessage(
+        language === Language.AR
+          ? 'جاري تحويل صفحات الـ PDF إلى Word باستخدام الذكاء الاصطناعي (معالجة متوازية فائقة السرعة)...'
+          : 'Converting PDF pages to Word using AI (high-speed parallel processing)...'
+      );
+    } else {
+      setProcessingMessage('');
+    }
 
     if (selectedFiles.length > 1 && !['merge', 'compare', 'img2pdf', 'chat', 'split'].includes(toolId)) {
       handleBatchProcess();
@@ -6719,7 +6729,18 @@ export const ToolPlayground: React.FC<ToolPlaygroundProps> = ({ toolId, toolName
                   </p>
                 </div>
               ) : (
-                <p className="text-lg font-semibold text-slate-800 dark:text-slate-200 animate-pulse">{texts.processing}</p>
+                <div className="text-center space-y-2 animate-pulse">
+                  <p className="text-lg font-semibold text-slate-800 dark:text-slate-200">
+                    {processingMessage || texts.processing}
+                  </p>
+                  {toolId === 'pdf2word' && (
+                    <p className="text-xs text-slate-400 font-medium">
+                      {language === Language.AR 
+                        ? 'تتم المعالجة بالتوازي لجميع الصفحات لضمان أفضل سرعة وأعلى دقة للنصوص العربية' 
+                        : 'Processing all pages in parallel for maximum speed and Arabic text fidelity'}
+                    </p>
+                  )}
+                </div>
               )}
             </div>
           )}

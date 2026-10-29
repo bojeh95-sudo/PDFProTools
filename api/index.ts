@@ -19,57 +19,91 @@ const { encryptPDF, PDFPermission } = pkg;
 
 import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 
-function detectArabicOrientation(text: string): 'reversed' | 'logical' | 'unknown' {
+import BidiFactory from 'bidi-js';
+
+const bidi = BidiFactory();
+
+let createCanvas: any;
+try {
+  const reqFn = typeof require !== 'undefined' ? require : createRequire(path.resolve('.'));
+  createCanvas = reqFn('pdfjs-dist/node_modules/@napi-rs/canvas').createCanvas;
+} catch (e) {
+  try {
+    const reqFn = typeof require !== 'undefined' ? require : createRequire(path.resolve('.'));
+    createCanvas = reqFn('@napi-rs/canvas').createCanvas;
+  } catch (err) {
+    console.error('Failed to load createCanvas from both pdfjs-dist and root:', err);
+  }
+}
+
+export function hasArabicCharacters(text: string): boolean {
+  return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(text);
+}
+
+export function isReversedArabicText(text: string): boolean {
   const words = text.split(/\s+/).map(w => w.trim()).filter(w => /[\u0600-\u06FF]/.test(w));
-  if (words.length === 0) return 'unknown';
+  if (words.length === 0) return false;
 
   let reversedCount = 0;
   let logicalCount = 0;
 
   for (const word of words) {
-    if (word.startsWith('ال') || word.startsWith('بال') || word.startsWith('وال') || word.startsWith('لل') || word.startsWith('في') || word.startsWith('من') || word.startsWith('على')) {
+    if (
+      word.startsWith('ال') || 
+      word.startsWith('بال') || 
+      word.startsWith('وال') || 
+      word.startsWith('لل') || 
+      word.startsWith('في') || 
+      word.startsWith('من') || 
+      word.startsWith('على') || 
+      word.startsWith('إلى') || 
+      word.startsWith('أن') || 
+      word.startsWith('إن')
+    ) {
       logicalCount++;
     }
-    if (word.endsWith('لا') || word.endsWith('لاب') || word.endsWith('لاو') || word.endsWith('لل') || word.endsWith('يف') || word.endsWith('نم') || word.endsWith('ىلع')) {
+    if (
+      word.endsWith('لا') || 
+      word.endsWith('لاب') || 
+      word.endsWith('لاو') || 
+      word.endsWith('لل') || 
+      word.endsWith('يف') || 
+      word.endsWith('نم') || 
+      word.endsWith('ىلع') || 
+      word.endsWith('ىلإ') || 
+      word.endsWith('نأ') || 
+      word.endsWith('نإ')
+    ) {
       reversedCount++;
     }
   }
 
-  if (reversedCount > logicalCount) return 'reversed';
-  if (logicalCount > reversedCount) return 'logical';
-  return 'unknown';
+  return reversedCount > logicalCount;
 }
 
-function fixArabicTextOrder(text: string): string {
+export function normalizeArabicText(text: string): string {
   if (!text) return '';
-  const arabicRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
-  const arabicRunRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g;
-
   const lines = text.split('\n');
-  const correctedLines = lines.map(line => {
+  const processedLines = lines.map(line => {
     const trimmed = line.trim();
-    if (!trimmed || !arabicRegex.test(trimmed)) {
+    if (!trimmed || !hasArabicCharacters(trimmed)) {
       return line;
     }
-    
-    const orientation = detectArabicOrientation(trimmed);
-    if (orientation === 'logical') {
+
+    if (!isReversedArabicText(trimmed)) {
       return line;
     }
-    
-    const tokens = line.split(/(\s+)/);
-    const reversedTokens = tokens.reverse();
-    const correctedTokens = reversedTokens.map(token => {
-      if (token.trim() && arabicRegex.test(token)) {
-        return token.replace(arabicRunRegex, match => match.split('').reverse().join(''));
-      }
-      return token;
-    });
-    
-    return correctedTokens.join('');
+
+    try {
+      const embeddingLevels = bidi.getEmbeddingLevels(line);
+      return bidi.getReorderedString(line, embeddingLevels);
+    } catch (e) {
+      console.error('BiDi normalization error:', e);
+      return line;
+    }
   });
-  
-  return correctedLines.join('\n');
+
+  return processedLines.join('\n');
 }
 
 function cleanPageDecorations(text: string): string {
@@ -170,35 +204,43 @@ function stringifyCSV(rows: string[][]): string {
   }).join('\n');
 }
 
+const pdfTextCache = new Map<string, string>();
+const MAX_CACHE_SIZE = 100;
+
+const pdf2wordCache = new Map<string, any[]>();
+const MAX_WORD_CACHE_SIZE = 100;
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let currentIndex = 0;
+
+  async function worker() {
+    while (currentIndex < items.length) {
+      const index = currentIndex++;
+      results[index] = await fn(items[index], index);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
+function computeBufferHash(buffer: Buffer): string {
+  return crypto.createHash('sha256').update(buffer).digest('hex');
+}
+
 function processExcelCSV(csvText: string): string {
   if (!csvText) return '';
   
   const rows = parseCSV(csvText);
   const processedRows = rows.map(row => {
     return row.map(cell => {
-      const trimmedCell = cell.trim();
-      const hasArabic = /[\u0600-\u06FF]/.test(trimmedCell);
-      if (!hasArabic) {
-        return cell;
-      }
-      
-      const orientation = detectArabicOrientation(trimmedCell);
-      if (orientation === 'logical') {
-        return cell;
-      }
-      
-      const tokens = cell.split(/(\s+)/);
-      const reversedTokens = tokens.reverse();
-      const correctedTokens = reversedTokens.map(token => {
-        const arabicRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/;
-        const arabicRunRegex = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]+/g;
-        if (token.trim() && arabicRegex.test(token)) {
-          return token.replace(arabicRunRegex, match => match.split('').reverse().join(''));
-        }
-        return token;
-      });
-      
-      return correctedTokens.join('');
+      return normalizeArabicText(cell);
     });
   });
   
@@ -206,23 +248,53 @@ function processExcelCSV(csvText: string): string {
 }
 
 async function extractTextFromPdfBuffer(buffer: Buffer): Promise<string> {
+  const fileHash = computeBufferHash(buffer);
+  const cachedText = pdfTextCache.get(fileHash);
+  if (cachedText !== undefined) {
+    console.log('[Cache Hit] Returning cached PDF extracted text for hash:', fileHash);
+    return cachedText;
+  }
+
+  const startTime = Date.now();
   const loadingTask = pdfjsLib.getDocument({
     data: new Uint8Array(buffer),
     useSystemFonts: true,
     disableFontFace: true,
   });
   const pdf = await loadingTask.promise;
-  let fullText = '';
+  
+  // Concurrently parse all pages in parallel using Promise.all
+  const pagePromises = [];
   for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
-    const textContent = await page.getTextContent();
-    const pageText = textContent.items
-      .map((item: any) => item.str)
-      .join(' ');
-    fullText += pageText + '\n';
+    pagePromises.push((async (pageNum) => {
+      const page = await pdf.getPage(pageNum);
+      const textContent = await page.getTextContent();
+      const pageText = textContent.items
+        .map((item: any) => item.str)
+        .join(' ');
+      return { pageNum, pageText };
+    })(i));
   }
-  const fixedText = fixArabicTextOrder(fullText);
-  return cleanPageDecorations(fixedText);
+  
+  const pagesResults = await Promise.all(pagePromises);
+  pagesResults.sort((a, b) => a.pageNum - b.pageNum);
+  const fullText = pagesResults.map(p => p.pageText).join('\n');
+
+  const fixedText = normalizeArabicText(fullText);
+  const cleanedText = cleanPageDecorations(fixedText);
+
+  // Manage cache capacity
+  if (pdfTextCache.size >= MAX_CACHE_SIZE) {
+    const firstKey = pdfTextCache.keys().next().value;
+    if (firstKey !== undefined) {
+      pdfTextCache.delete(firstKey);
+    }
+  }
+  pdfTextCache.set(fileHash, cleanedText);
+
+  const duration = Date.now() - startTime;
+  console.log(`[extractTextFromPdfBuffer] Processed ${pdf.numPages} pages in ${duration}ms (Cache Miss)`);
+  return cleanedText;
 }
 
 
@@ -287,10 +359,9 @@ Format the translated output into beautiful, organized Markdown with clear headi
 Ensure all extracted numbers, emails, addresses, dates, or contact info are listed clearly in the original language.`;
           break;
         case 'ocr':
-          userPrompt = `Perform ultra-accurate OCR text recognition on this scanned document or image. 
+          userPrompt = `اقرأ كل النص الموجود بهذه الصورة/المستند بدقة تامة، سطراً بسطر وكلمة بكلمة، تماماً كما يظهر بصرياً. احرص بشكل خاص على إخراج أي نص عربي بترتيبه الصحيح ومعناه المقروء الطبيعي (من اليمين لليسار داخل الجملة، لكن بترتيب حروف وكلمات صحيح ومفهوم كما يقرأه إنسان عربي)، دون أي تبديل أو قلب في ترتيب الحروف أو الكلمات. عند استخراج أي سطر يحتوي على نص عربي بالكامل (بدون أرقام أو كلمات إنجليزية بنفس السطر)، تأكد بشكل خاص أن ترتيب الكلمات من اليمين لليسار كما تُقرأ طبيعياً بالعربية الفصحى، تماماً كما تظهر بصرياً في الصورة من البداية للنهاية. لا تعكس ولا تبدل ترتيب الكلمات في أي سطر عربي خالص. اقرأ كل سطر عربي كوحدة متكاملة بترتيبها الصحيح المقروء، تماماً كما يقرأها متحدث عربي أصلي من اليمين إلى اليسار. حافظ على ترتيب الأعمدة والجداول كما هي بالصورة الأصلية (خصوصاً الأعمدة الإنجليزية والأرقام والتواريخ يجب أن تبقى بنفس ترتيبها من اليسار لليمين). أرجع النص فقط دون أي تعليق أو تلخيص إضافي.
 - Primary Document Language: ${ocrLanguage || 'Arabic'}
-- Output Mode: ${ocrOutputType === 'searchable_pdf' ? 'Re-create a structured, coordinates-aware text outline or markdown' : 'Extract clean raw text paragraphs with perfect spacing'}
-Ensure every character, sign, and word is perfectly recognized and formatted.`;
+- Output Mode: ${ocrOutputType === 'searchable_pdf' ? 'Re-create a structured, coordinates-aware text outline or markdown' : 'Extract clean raw text paragraphs with perfect spacing'}`;
           break;
         case 'format':
           userPrompt = `Analyze this document, resolve any visual layout flaws, and structure it into a beautiful, highly professional, publication-ready layout. 
@@ -299,7 +370,7 @@ Ensure every character, sign, and word is perfectly recognized and formatted.`;
 Return a pristine Markdown layout with consistent padding, headings, and lists.`;
           break;
         case 'pdf2word':
-          userPrompt = 'Analyze the provided PDF file. Extract its complete content, maintaining the correct reading order, sections, headings, lists, and tables. Output the extracted elements as a valid JSON array of block objects. Each block object must have the following structure: - "type": Choose from "title", "heading1", "heading2", "paragraph", "bullet", "numbered", "table". - "text": For title, heading1, heading2, paragraph, bullet, numbered. - "rows": For "table", an array of rows, where each row is an array of cell strings (e.g. [["Col1", "Col2"], ["Val1", "Val2"]]). - "alignment": "left" | "center" | "right" (optional, default left). - "bold": boolean (optional). Return ONLY the raw JSON array. Do not put markdown formatting or backticks around it. If you must use formatting, do not use backticks outside of the JSON. Make sure the JSON is fully valid and parseable.';
+          userPrompt = 'اقرأ كل النص الموجود بهذا المستند بدقة تامة، سطراً بسطر وكلمة بكلمة، تماماً كما يظهر بصرياً. احرص بشكل خاص على إخراج أي نص عربي بترتيبه الصحيح ومعناه المقروء الطبيعي (من اليمين لليسار داخل الجملة، لكن بترتيب حروف وكلمات صحيح ومفهوم كما يقرأه إنسان عربي)، دون أي تبديل أو قلب في ترتيب الحروف أو الكلمات. عند استخراج أي سطر يحتوي على نص عربي بالكامل (بدون أرقام أو كلمات إنجليزية بنفس السطر)، تأكد بشكل خاص أن ترتيب الكلمات من اليمين لليسار كما تُقرأ طبيعياً بالعربية الفصحى، تماماً كما تظهر بصرياً في الصورة من البداية للنهاية. لا تعكس ولا تبدل ترتيب الكلمات في أي سطر عربي خالص. اقرأ كل سطر عربي كوحدة متكاملة بترتيبها الصحيح المقروء، تماماً كما يقرأها متحدث عربي أصلي من اليمين إلى اليسار. حافظ على ترتيب الأعمدة والجداول كما هي بالصورة الأصلية (خصوصاً الأعمدة الإنجليزية والأرقام والتواريخ يجب أن تبقى بنفس ترتيبها من اليسار لليمين). Output the extracted elements as a valid JSON array of block objects. Each block object must have the following structure: - "type": Choose from "title", "heading1", "heading2", "paragraph", "bullet", "numbered", "table". - "text": For title, heading1, heading2, paragraph, bullet, numbered. - "rows": For "table", an array of rows, where each row is an array of cell strings (e.g. [["Col1", "Col2"], ["Val1", "Val2"]]). - "alignment": "left" | "center" | "right" (optional, default left). - "bold": boolean (optional). Return ONLY the raw JSON array. Do not put markdown formatting or backticks around it. If you must use formatting, do not use backticks outside of the JSON. Make sure the JSON is fully valid and parseable.';
           break;
         case 'chat':
           userPrompt = question 
@@ -511,43 +582,85 @@ Ensure it is fully customized to the document's content and written in a highly 
       // Convert base64 data to a Buffer
       const buffer = Buffer.from(fileData, 'base64');
 
-      // Parse PDF using pdfjs-dist
-      let extractedText = '';
-      try {
-        extractedText = await extractTextFromPdfBuffer(buffer);
-      } catch (parseErr: any) {
-        console.error('pdf extraction failed:', parseErr);
-        return res.status(400).json({ error: 'Failed to read PDF file content: ' + parseErr.message });
-      }
-      if (!extractedText.trim()) {
-        return res.status(400).json({ error: 'The uploaded PDF does not contain any readable text.' });
-      }
-
-      const isArabic = /[\u0600-\u06FF]/.test(extractedText);
-
+      const fileHash = computeBufferHash(buffer);
+      const cachedBlocks = pdf2wordCache.get(fileHash);
       let blocks: any[] = [];
-      const hasGemini = !!process.env.GEMINI_API_KEY;
+      let isArabic = false;
 
-      if (hasGemini) {
-        try {
-          const ai = new GoogleGenAI({
-            apiKey: process.env.GEMINI_API_KEY!,
-            httpOptions: {
-              headers: {
-                'User-Agent': 'aistudio-build',
+      if (cachedBlocks !== undefined) {
+        console.log('[pdf2word] Cache Hit! Returning cached blocks for hash:', fileHash);
+        blocks = cachedBlocks;
+        isArabic = blocks.some(b => b.text && /[\u0600-\u06FF]/.test(b.text));
+      } else {
+        const startTime = Date.now();
+        const hasGemini = !!process.env.GEMINI_API_KEY;
+
+        if (hasGemini) {
+          try {
+            const ai = new GoogleGenAI({
+              apiKey: process.env.GEMINI_API_KEY!,
+              httpOptions: {
+                headers: {
+                  'User-Agent': 'aistudio-build',
+                }
               }
-            }
-          });
+            });
 
-          // Truncate text to avoid model limits
-          const textSample = extractedText.substring(0, 40000);
+            // 1. Load the document using pdfjsLib
+            const loadingTask = pdfjsLib.getDocument({
+              data: new Uint8Array(buffer),
+              useSystemFonts: true,
+              disableFontFace: true,
+            });
+            const pdf = await loadingTask.promise;
+            const pageCount = pdf.numPages;
+            console.log(`[pdf2word] Document loaded. Page count: ${pageCount}`);
 
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.5-flash',
-            contents: {
-              parts: [
-                {
-                  text: `Analyze the provided text extracted from a PDF. Reconstruct the document structure (titles, headings, paragraphs, lists, tables) as a valid JSON array of block objects.
+            const pageNumbers = Array.from({ length: pageCount }, (_, i) => i + 1);
+
+            // 2. Map pages concurrently with limit (concurrency: 3)
+            const concurrencyLimit = 3;
+            const pageResults = await mapConcurrent(
+              pageNumbers,
+              concurrencyLimit,
+              async (pageNum) => {
+                console.log(`[pdf2word] Rendering page ${pageNum}/${pageCount} to image...`);
+                const page = await pdf.getPage(pageNum);
+                const viewport = page.getViewport({ scale: 1.5 });
+                const canvas = createCanvas(viewport.width, viewport.height);
+                const context = canvas.getContext('2d');
+                
+                await page.render({
+                  canvasContext: context,
+                  viewport: viewport,
+                  canvas: canvas as any
+                } as any).promise;
+
+                const imageBuffer = canvas.toBuffer('image/jpeg');
+                console.log(`[pdf2word] Page ${pageNum}/${pageCount} rendered successfully. Image buffer length: ${imageBuffer.length}`);
+
+                // Check that the image buffer is valid and not empty
+                if (!imageBuffer || imageBuffer.length < 100) {
+                  throw new Error(`Failed to render page ${pageNum} to a valid image`);
+                }
+
+                const base64Image = imageBuffer.toString('base64');
+                console.log(`[pdf2word] Sending page ${pageNum}/${pageCount} to Gemini as image/jpeg...`);
+
+                const response = await ai.models.generateContent({
+                  model: 'gemini-3.5-flash',
+                  contents: {
+                    parts: [
+                      {
+                        inlineData: {
+                          data: base64Image,
+                          mimeType: 'image/jpeg'
+                        }
+                      },
+                      {
+                        text: `اقرأ كل النص الموجود بهذه الصورة بدقة تامة، سطراً بسطر وكلمة بكلمة، تماماً كما يظهر بصرياً. احرص بشكل خاص على إخراج أي نص عربي بترتيبه الصحيح ومعناه المقروء الطبيعي (من اليمين لليسار داخل الجملة، لكن بترتيب حروف وكلمات صحيح ومفهوم كما يقرأه إنسان عربي)، دون أي تبديل أو قلب في ترتيب الحروف أو الكلمات. عند استخراج أي سطر يحتوي على نص عربي بالكامل (بدون أرقام أو كلمات إنجليزية بنفس السطر)، تأكد بشكل خاص أن ترتيب الكلمات من اليمين لليسار كما تُقرأ طبيعياً بالعربية الفصحى، تماماً كما تظهر بصرياً في الصورة من البداية للنهاية. لا تعكس ولا تبدل ترتيب الكلمات في أي سطر عربي خالص. اقرأ كل سطر عربي كوحدة متكاملة بترتيبها الصحيح المقروء، تماماً كما يقرأها متحدث عربي أصلي من اليمين إلى اليسار. حافظ على ترتيب الأعمدة والجداول كما هي بالصورة الأصلية (خصوصاً الأعمدة الإنجليزية والأرقام والتواريخ يجب أن تبقى بنفس ترتيبها من اليسار لليمين).
+
+Reconstruct the document structure as a valid JSON array of block objects.
 Each block object must have the following structure:
 - "type": "title" | "heading1" | "heading2" | "paragraph" | "bullet" | "numbered" | "table"
 - "text": string (for non-table blocks)
@@ -555,38 +668,83 @@ Each block object must have the following structure:
 - "alignment": "left" | "center" | "right" (optional, default "left")
 - "bold": boolean (optional)
 
-Example output:
+Example output format:
 [
-  {"type": "title", "text": "Document Title", "alignment": "center"},
-  {"type": "heading1", "text": "Section 1"},
-  {"type": "paragraph", "text": "This is a paragraph of the section."}
+  {"type": "title", "text": "عنوان المستند", "alignment": "center"},
+  {"type": "heading1", "text": "القسم الأول"},
+  {"type": "paragraph", "text": "هذا نص الفقرة بترتيب كلمات عربي طبيعي ومفهوم."}
 ]
 
-Return ONLY the raw JSON array. Do not put markdown formatting or backticks around it. If you must use formatting, do not use backticks outside of the JSON. Make sure the JSON is fully valid and parseable.
+CRITICAL RULES FOR ARABIC & BILINGUAL TEXT:
+- You must preserve the natural, logical Arabic text order. For pure Arabic lines, headers, or table cell values (without English/digits), ensure word order is strictly Right-To-Left as naturally read by a native speaker. Do NOT reverse word order or letter order.
+- Ensure mixed language sections (e.g. English, Arabic, and numbers) are merged in correct reading layout sequence.
+- Do NOT add markdown formatting (like **bold** or italics) inside the "text" values.
+- Do NOT output anything other than a valid parseable JSON array. Return ONLY the raw JSON array. Do not put markdown headers, introductory text, or code block triple backticks around the JSON.`
+                      }
+                    ]
+                  }
+                });
 
-Here is the extracted text:
-${textSample}`
+                const rawText = response.text || '';
+                console.log(`[pdf2word] Page ${pageNum}/${pageCount} processed successfully. Response length: ${rawText.length}`);
+                
+                let cleaned = rawText.trim();
+                if (cleaned.startsWith('```')) {
+                  cleaned = cleaned.replace(/^```json\s*/i, '');
+                  cleaned = cleaned.replace(/```\s*$/, '');
+                  cleaned = cleaned.trim();
                 }
-              ]
-            }
-          });
 
-          const rawResult = response.text || '';
-          let cleaned = rawResult.trim();
-          if (cleaned.startsWith('```')) {
-            cleaned = cleaned.replace(/^```json\s*/i, '');
-            cleaned = cleaned.replace(/```\s*$/, '');
-            cleaned = cleaned.trim();
+                try {
+                  const parsed = JSON.parse(cleaned);
+                  if (Array.isArray(parsed)) {
+                    return parsed;
+                  }
+                } catch (e) {
+                  console.error(`[pdf2word] Failed to parse JSON from page ${pageNum}:`, e, cleaned);
+                }
+                
+                return [{ type: 'paragraph', text: rawText }];
+              }
+            );
+
+            // 3. Combine results of all pages
+            blocks = pageResults.flat();
+            isArabic = blocks.some(b => b.text && /[\u0600-\u06FF]/.test(b.text));
+
+            // Cache the result
+            if (pdf2wordCache.size >= MAX_WORD_CACHE_SIZE) {
+              const firstKey = pdf2wordCache.keys().next().value;
+              if (firstKey !== undefined) {
+                pdf2wordCache.delete(firstKey);
+              }
+            }
+            pdf2wordCache.set(fileHash, blocks);
+
+            const duration = Date.now() - startTime;
+            console.log(`[pdf2word] Completed ${pageCount} pages in ${duration}ms (Cache Miss)`);
+          } catch (aiErr) {
+            console.error('[pdf2word] Gemini parallel processing failed, falling back to local text extraction:', aiErr);
           }
-          blocks = JSON.parse(cleaned);
-        } catch (aiErr) {
-          console.error('Gemini failed to structure PDF text, using local parser:', aiErr);
         }
       }
 
       // Fallback local parser if Gemini is absent or fails
       if (!blocks || blocks.length === 0) {
         blocks = [];
+        let extractedText = '';
+        try {
+          extractedText = await extractTextFromPdfBuffer(buffer);
+        } catch (parseErr: any) {
+          console.error('pdf extraction failed:', parseErr);
+          return res.status(400).json({ error: 'Failed to read PDF file content: ' + parseErr.message });
+        }
+        if (!extractedText.trim()) {
+          return res.status(400).json({ error: 'The uploaded PDF does not contain any readable text.' });
+        }
+
+        isArabic = /[\u0600-\u06FF]/.test(extractedText);
+
         const lines = extractedText.split('\n');
         let currentParagraph = '';
 
